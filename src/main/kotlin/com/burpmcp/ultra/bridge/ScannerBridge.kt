@@ -133,12 +133,51 @@ class ScannerBridge(
 
             val auditTask: Audit = api.scanner().startAudit(auditConfig)
 
-            // If raw requests are provided, add them to the audit task
+            var seededRequests = 0
+
+            // Seed simple GET requests from urls. Each URL becomes a request with a
+            // proper HttpService — addRequest() rejects service-less requests on
+            // Burp 2026.x with "HttpRequest must have an HttpService".
+            urls?.forEach { url ->
+                try {
+                    val uri = java.net.URI(url)
+                    val secure = uri.scheme.equals("https", ignoreCase = true)
+                    val port = if (uri.port > 0) uri.port else if (secure) 443 else 80
+                    val pathAndQuery = (uri.rawPath?.takeIf { it.isNotEmpty() } ?: "/") +
+                        (uri.rawQuery?.let { "?$it" } ?: "")
+                    val hostHeader = if (uri.port > 0) "${uri.host}:${uri.port}" else uri.host
+                    val raw = "GET $pathAndQuery HTTP/1.1\r\n" +
+                        "Host: $hostHeader\r\n" +
+                        "User-Agent: BurpMCP-Ultra\r\n" +
+                        "Connection: close\r\n\r\n"
+                    auditTask.addRequest(HttpRequest.httpRequest(HttpService.httpService(uri.host, port, secure), raw))
+                    seededRequests++
+                } catch (_: Exception) {
+                    // Skip malformed URLs
+                }
+            }
+
+            // If raw requests are provided, add them to the audit task.
+            // A decoded raw request carries no HttpService, so derive one from its
+            // Host header (default https/443 unless the port looks plain-http).
             requests?.forEach { reqBase64 ->
                 try {
-                    val decoded = Base64.getDecoder().decode(reqBase64)
-                    val httpRequest = HttpRequest.httpRequest(BurpByteArray.byteArray(*decoded))
-                    auditTask.addRequest(httpRequest)
+                    val raw = String(Base64.getDecoder().decode(reqBase64), Charsets.ISO_8859_1)
+                    val hostHeader = Regex("(?im)^Host:\\s*([^\\r\\n]+)").find(raw)?.groupValues?.get(1)?.trim()
+                    if (hostHeader.isNullOrEmpty()) return@forEach // no Host header → cannot derive a service
+                    val host: String
+                    val port: Int
+                    if (hostHeader.contains(':')) {
+                        val parts = hostHeader.split(':', limit = 2)
+                        host = parts[0]
+                        port = parts[1].toIntOrNull() ?: 443
+                    } else {
+                        host = hostHeader
+                        port = 443
+                    }
+                    val secure = port != 80 && port != 8080 && port != 8000
+                    auditTask.addRequest(HttpRequest.httpRequest(HttpService.httpService(host, port, secure), raw))
+                    seededRequests++
                 } catch (_: Exception) {
                     // Skip malformed requests
                 }
@@ -159,6 +198,7 @@ class ScannerBridge(
                 put("task_id", taskId)
                 put("type", "audit")
                 put("status", statusMsg)
+                put("seeded_requests", seededRequests)
                 put("audit_mode", auditMode ?: "normal")
                 put("crawl_first", crawlFirst)
                 put("created_at", scanTask.createdAt)
